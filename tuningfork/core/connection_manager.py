@@ -1,279 +1,396 @@
 """
-Database Performance Optimization Tool - Stage 1.1 Implementation
-Basic Project Setup and Connection Manager
+Connection Manager module for TuningFork database performance optimization tool.
 
-This module implements the core infrastructure for the database
-performance optimization tool, including the project structure,
-connection manager, configuration management, and basic CLI interface.
+This module provides functionality for managing database connections.
 """
 
-import os
-import json
 import logging
-import argparse
-from typing import Dict, Any, Optional, List, Tuple
-import psycopg2
-import mysql.connector
-import pyodbc
-import sqlite3
+import importlib
+from typing import Dict, Any, Optional, List, Union
 
 from tuningfork.core.config_manager import ConfigManager
+from tuningfork.util.exceptions import ConnectionError
 
 logger = logging.getLogger(__name__)
 
 
+class Connection:
+    """
+    Represents a database connection.
+    
+    This class is a wrapper around different database connection objects.
+    """
+    
+    def __init__(self, connection_id: str, db_type: str, connection_obj, config: Dict[str, Any]):
+        """
+        Initialize a Connection object.
+        
+        Args:
+            connection_id: The connection ID
+            db_type: The database type (postgresql, mysql, mssql, sqlite)
+            connection_obj: The actual database connection object
+            config: The connection configuration
+        """
+        self.connection_id = connection_id
+        self.db_type = db_type.lower()
+        self.connection_obj = connection_obj
+        self.config = config
+        self.is_ssh_tunnel = False
+        self.ssh_tunnel = None
+    
+    def cursor(self):
+        """
+        Get a cursor for the connection.
+        
+        Returns:
+            A database cursor
+        """
+        return self.connection_obj.cursor()
+    
+    def commit(self):
+        """Commit the current transaction."""
+        return self.connection_obj.commit()
+    
+    def rollback(self):
+        """Rollback the current transaction."""
+        return self.connection_obj.rollback()
+    
+    def close(self):
+        """Close the connection."""
+        if self.is_connected():
+            self.connection_obj.close()
+            
+            # Close SSH tunnel if present
+            if self.is_ssh_tunnel and self.ssh_tunnel:
+                try:
+                    self.ssh_tunnel.close()
+                    logger.info(f"Closed SSH tunnel for connection {self.connection_id}")
+                except Exception as e:
+                    logger.error(f"Error closing SSH tunnel for connection {self.connection_id}: {str(e)}")
+    
+    def is_connected(self) -> bool:
+        """
+        Check if the connection is still active.
+        
+        Returns:
+            True if the connection is active, False otherwise
+        """
+        if not self.connection_obj:
+            return False
+            
+        try:
+            # Different ways to check connection based on database type
+            if self.db_type == "postgresql":
+                return not self.connection_obj.closed
+            elif self.db_type == "mysql":
+                self.connection_obj.ping(reconnect=False)
+                return True
+            elif self.db_type == "mssql":
+                cursor = self.connection_obj.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+                return True
+            elif self.db_type == "sqlite":
+                cursor = self.connection_obj.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+                return True
+            else:
+                # Default for unknown types - just return True and hope for the best
+                return True
+        except Exception:
+            return False
+    
+    def execute_query(self, query: str, params: Optional[Union[tuple, dict]] = None) -> List[tuple]:
+        """
+        Execute a query and return the results.
+        
+        Args:
+            query: The SQL query to execute
+            params: Parameters for the query
+            
+        Returns:
+            List of result rows
+            
+        Raises:
+            ConnectionError: If there is an error executing the query
+        """
+        try:
+            cursor = self.cursor()
+            cursor.execute(query, params or ())
+            
+            # Get results if it's a SELECT query
+            if query.strip().upper().startswith(("SELECT", "SHOW", "DESCRIBE", "PRAGMA")):
+                results = cursor.fetchall()
+            else:
+                results = []
+                
+            cursor.close()
+            return results
+        except Exception as e:
+            logger.error(f"Error executing query: {str(e)}")
+            raise ConnectionError(f"Error executing query: {str(e)}")
+
+
 class ConnectionManager:
     """
-    Manages database connections across different platforms.
+    Manages database connections.
     
-    This class is responsible for establishing, managing, and closing
-    connections to various database systems.
+    This class is responsible for creating, storing, and closing database connections.
     """
     
     def __init__(self, config_manager: ConfigManager):
         """
-        Initialize the ConnectionManager.
+        Initialize ConnectionManager.
         
         Args:
-            config_manager: A ConfigManager instance for accessing configuration.
+            config_manager: The ConfigManager instance
         """
         self.config_manager = config_manager
-        self.connections = {}  # Dictionary to store active connections
-        self.connection_details = {}  # Dictionary to store connection details
+        self.connections: Dict[str, Connection] = {}
     
-    def connect(self, 
-                connection_id: str, 
-                db_type: str, 
-                host: str, 
-                port: int, 
-                username: str, 
-                password: str, 
-                database: str,
-                **kwargs) -> Tuple[bool, Optional[str]]:
+    def connect(self, connection_id: str, **kwargs) -> Connection:
         """
-        Establish a database connection.
+        Create a new database connection.
         
         Args:
-            connection_id: Unique identifier for this connection.
-            db_type: Type of database (postgres, mysql, mssql, sqlite).
-            host: Database host.
-            port: Database port.
-            username: Database username.
-            password: Database password.
-            database: Database name.
-            **kwargs: Additional connection parameters.
+            connection_id: The connection ID
+            **kwargs: Additional connection parameters that override configuration
             
         Returns:
-            A tuple of (success, error_message).
+            The Connection object
             
         Raises:
-            ValueError: If an unsupported database type is specified.
+            ConnectionError: If there is an error creating the connection
         """
-        # Check if connection already exists
-        if connection_id in self.connections:
-            logger.warning(f"Connection {connection_id} already exists")
-            return False, "Connection already exists"
-        
-        # Store connection details for later reference
-        self.connection_details[connection_id] = {
-            "db_type": db_type,
-            "host": host,
-            "port": port,
-            "username": username,
-            "database": database,
-            "additional_params": kwargs
-        }
-        
         try:
-            # Connect based on database type
-            if db_type.lower() == "postgres":
-                conn = psycopg2.connect(
-                    host=host,
-                    port=port,
-                    user=username,
-                    password=password,
-                    database=database,
-                    **kwargs
-                )
-            elif db_type.lower() == "mysql":
-                conn = mysql.connector.connect(
-                    host=host,
-                    port=port,
-                    user=username,
-                    password=password,
-                    database=database,
-                    **kwargs
-                )
-            elif db_type.lower() == "mssql":
-                conn_string = (
-                    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                    f"SERVER={host},{port};"
-                    f"DATABASE={database};"
-                    f"UID={username};"
-                    f"PWD={password}"
-                )
-                conn = pyodbc.connect(conn_string)
-            elif db_type.lower() == "sqlite":
-                # For SQLite, the database parameter is the file path
-                conn = sqlite3.connect(database)
+            # Get connection configuration
+            config = self.config_manager.get_connection_config(connection_id).copy()
+            
+            # Override with any provided kwargs
+            config.update(kwargs)
+            
+            # Get database type
+            db_type = config.get("type", "").lower()
+            if not db_type:
+                raise ConnectionError(f"Database type not specified for connection {connection_id}")
+            
+            # Create connection based on database type
+            connection_obj = None
+            
+            if db_type == "postgresql":
+                connection_obj = self._connect_postgresql(config)
+            elif db_type == "mysql":
+                connection_obj = self._connect_mysql(config)
+            elif db_type == "mssql":
+                connection_obj = self._connect_mssql(config)
+            elif db_type == "sqlite":
+                connection_obj = self._connect_sqlite(config)
             else:
-                return False, f"Unsupported database type: {db_type}"
+                raise ConnectionError(f"Unsupported database type: {db_type}")
             
-            # Store the connection
-            self.connections[connection_id] = conn
+            # Create Connection object
+            connection = Connection(connection_id, db_type, connection_obj, config)
             
-            # Save connection configuration
-            connection_config = {
-                "db_type": db_type,
-                "host": host,
-                "port": port,
-                "username": username,
-                "database": database,
-                **kwargs
-            }
-            # Don't store the password in the config
-            self.config_manager.add_connection_config(connection_id, connection_config)
+            # Store connection
+            self.connections[connection_id] = connection
             
-            logger.info(f"Successfully connected to {db_type} database at {host}:{port}/{database} as {username}")
-            return True, None
+            logger.info(f"Created connection {connection_id} ({db_type})")
+            return connection
         
         except Exception as e:
-            logger.error(f"Failed to connect to {db_type} database: {str(e)}")
-            return False, str(e)
+            logger.error(f"Error creating connection {connection_id}: {str(e)}")
+            raise ConnectionError(f"Error creating connection {connection_id}: {str(e)}")
     
-    def disconnect(self, connection_id: str) -> Tuple[bool, Optional[str]]:
+    def get_connection(self, connection_id: str) -> Optional[Connection]:
         """
-        Close a database connection.
+        Get an existing connection.
         
         Args:
-            connection_id: ID of the connection to close.
+            connection_id: The connection ID
             
         Returns:
-            A tuple of (success, error_message).
+            The Connection object or None if not found
         """
-        if connection_id not in self.connections:
-            logger.warning(f"Connection {connection_id} does not exist")
-            return False, "Connection does not exist"
+        connection = self.connections.get(connection_id)
         
-        try:
-            self.connections[connection_id].close()
+        # Check if connection is still active
+        if connection and not connection.is_connected():
+            logger.warning(f"Connection {connection_id} is no longer active, removing it")
             del self.connections[connection_id]
-            del self.connection_details[connection_id]
-            logger.info(f"Disconnected from {connection_id}")
-            return True, None
-        except Exception as e:
-            logger.error(f"Failed to disconnect from {connection_id}: {str(e)}")
-            return False, str(e)
+            return None
+            
+        return connection
     
-    def disconnect_all(self) -> None:
+    def close_connection(self, connection_id: str) -> bool:
         """
-        Close all database connections.
+        Close a connection.
+        
+        Args:
+            connection_id: The connection ID
+            
+        Returns:
+            True if the connection was closed, False if it was not found
         """
+        connection = self.connections.get(connection_id)
+        if connection:
+            try:
+                connection.close()
+                del self.connections[connection_id]
+                logger.info(f"Closed connection {connection_id}")
+                return True
+            except Exception as e:
+                logger.error(f"Error closing connection {connection_id}: {str(e)}")
+                return False
+        else:
+            logger.warning(f"Connection {connection_id} not found")
+            return False
+    
+    def close_all_connections(self) -> None:
+        """Close all active connections."""
         for connection_id in list(self.connections.keys()):
-            self.disconnect(connection_id)
+            self.close_connection(connection_id)
     
-    def execute_query(self, 
-                     connection_id: str, 
-                     query: str, 
-                     params: Optional[Any] = None) -> Tuple[bool, Any, Optional[str]]:
-        """
-        Execute a query on the specified connection.
-        
-        Args:
-            connection_id: ID of the connection to use.
-            query: The SQL query to execute.
-            params: Optional parameters for the query.
-            
-        Returns:
-            A tuple of (success, result, error_message).
-        """
-        if connection_id not in self.connections:
-            logger.warning(f"Connection {connection_id} does not exist")
-            return False, None, "Connection does not exist"
-        
-        conn = self.connections[connection_id]
-        db_type = self.connection_details[connection_id]["db_type"]
-        
-        try:
-            cursor = conn.cursor()
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            
-            # Fetch results if this is a SELECT query
-            if query.strip().lower().startswith("select"):
-                result = cursor.fetchall()
-            else:
-                result = cursor.rowcount
-                conn.commit()
-            
-            cursor.close()
-            return True, result, None
-        
-        except Exception as e:
-            logger.error(f"Failed to execute query on {connection_id}: {str(e)}")
-            return False, None, str(e)
-    
-    def get_connection_info(self, connection_id: str) -> Dict[str, Any]:
-        """
-        Get information about a specific connection.
-        
-        Args:
-            connection_id: ID of the connection.
-            
-        Returns:
-            A dictionary with connection information.
-            
-        Raises:
-            KeyError: If the connection ID is not found.
-        """
-        if connection_id not in self.connection_details:
-            raise KeyError(f"Connection {connection_id} does not exist")
-        
-        return self.connection_details[connection_id]
-    
-    def list_connections(self) -> List[str]:
+    def list_connections(self) -> List[Dict[str, Any]]:
         """
         List all active connections.
         
         Returns:
-            A list of connection IDs.
+            List of connection information dictionaries
         """
-        return list(self.connections.keys())
+        return [
+            {
+                "connection_id": conn.connection_id,
+                "db_type": conn.db_type,
+                "config": {k: v for k, v in conn.config.items() if k != "password"}
+            }
+            for conn in self.connections.values()
+        ]
     
-    def is_connected(self, connection_id: str) -> bool:
+    def _connect_postgresql(self, config: Dict[str, Any]):
         """
-        Check if a connection is active.
+        Create a PostgreSQL connection.
         
         Args:
-            connection_id: ID of the connection.
+            config: Connection configuration
             
         Returns:
-            True if the connection is active, False otherwise.
+            psycopg2 connection object
+            
+        Raises:
+            ConnectionError: If there is an error creating the connection
         """
-        if connection_id not in self.connections:
-            return False
-        
-        # Test the connection by executing a simple query
         try:
-            conn = self.connections[connection_id]
-            db_type = self.connection_details[connection_id]["db_type"]
+            import psycopg2
             
-            cursor = conn.cursor()
-            if db_type.lower() == "postgres":
-                cursor.execute("SELECT 1")
-            elif db_type.lower() == "mysql":
-                cursor.execute("SELECT 1")
-            elif db_type.lower() == "mssql":
-                cursor.execute("SELECT 1")
-            elif db_type.lower() == "sqlite":
-                cursor.execute("SELECT 1")
+            # Create connection
+            conn = psycopg2.connect(
+                host=config.get("host", "localhost"),
+                port=config.get("port", 5432),
+                database=config.get("database", "postgres"),
+                user=config.get("user", "postgres"),
+                password=config.get("password", ""),
+                connect_timeout=config.get("timeout", 30)
+            )
             
-            cursor.fetchone()
-            cursor.close()
-            return True
-        except Exception:
-            # Connection is broken
-            del self.connections[connection_id]
-            return False
+            return conn
+        except ImportError:
+            raise ConnectionError("psycopg2 module not found. Install it with: pip install psycopg2-binary")
+        except Exception as e:
+            raise ConnectionError(f"Error connecting to PostgreSQL: {str(e)}")
+    
+    def _connect_mysql(self, config: Dict[str, Any]):
+        """
+        Create a MySQL connection.
+        
+        Args:
+            config: Connection configuration
+            
+        Returns:
+            mysql.connector connection object
+            
+        Raises:
+            ConnectionError: If there is an error creating the connection
+        """
+        try:
+            import mysql.connector
+            
+            # Create connection
+            conn = mysql.connector.connect(
+                host=config.get("host", "localhost"),
+                port=config.get("port", 3306),
+                database=config.get("database", "mysql"),
+                user=config.get("user", "root"),
+                password=config.get("password", ""),
+                connection_timeout=config.get("timeout", 30)
+            )
+            
+            return conn
+        except ImportError:
+            raise ConnectionError("mysql-connector-python module not found. Install it with: pip install mysql-connector-python")
+        except Exception as e:
+            raise ConnectionError(f"Error connecting to MySQL: {str(e)}")
+    
+    def _connect_mssql(self, config: Dict[str, Any]):
+        """
+        Create a Microsoft SQL Server connection.
+        
+        Args:
+            config: Connection configuration
+            
+        Returns:
+            pyodbc connection object
+            
+        Raises:
+            ConnectionError: If there is an error creating the connection
+        """
+        try:
+            import pyodbc
+            
+            # Create connection string
+            conn_str = (
+                f"DRIVER={config.get('driver', '{ODBC Driver 17 for SQL Server}')};"
+                f"SERVER={config.get('server', 'localhost')},"
+                f"{config.get('port', 1433)};"
+                f"DATABASE={config.get('database', 'master')};"
+                f"UID={config.get('user', 'sa')};"
+                f"PWD={config.get('password', '')};"
+                f"Timeout={config.get('timeout', 30)};"
+            )
+            
+            # Create connection
+            conn = pyodbc.connect(conn_str)
+            
+            return conn
+        except ImportError:
+            raise ConnectionError("pyodbc module not found. Install it with: pip install pyodbc")
+        except Exception as e:
+            raise ConnectionError(f"Error connecting to MSSQL: {str(e)}")
+    
+    def _connect_sqlite(self, config: Dict[str, Any]):
+        """
+        Create a SQLite connection.
+        
+        Args:
+            config: Connection configuration
+            
+        Returns:
+            sqlite3 connection object
+            
+        Raises:
+            ConnectionError: If there is an error creating the connection
+        """
+        try:
+            import sqlite3
+            
+            # Create connection
+            conn = sqlite3.connect(
+                config.get("database", ":memory:"),
+                timeout=config.get("timeout", 30)
+            )
+            
+            return conn
+        except ImportError:
+            raise ConnectionError("sqlite3 module not found, but it should be included in Python standard library")
+        except Exception as e:
+            raise ConnectionError(f"Error connecting to SQLite: {str(e)}")

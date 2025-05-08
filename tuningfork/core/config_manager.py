@@ -1,123 +1,126 @@
 """
-Database Performance Optimization Tool - Stage 1.1 Implementation
-Basic Project Setup and Connection Manager
+Configuration Manager module for TuningFork database performance optimization tool.
 
-This module implements the core infrastructure for the database
-performance optimization tool, including the project structure,
-connection manager, configuration management, and basic CLI interface.
+This module provides functionality for loading, accessing, and saving configuration.
 """
 
 import os
 import json
 import logging
-import argparse
-from typing import Dict, Any, Optional, List, Tuple
-import psycopg2
-import mysql.connector
-import pyodbc
-import sqlite3
+from typing import Dict, Any, Optional, Union
 
 logger = logging.getLogger(__name__)
 
+
 class ConfigManager:
     """
-    Handles configuration settings and credentials.
+    Manages configuration settings for the TuningFork tool.
     
-    This class is responsible for loading, accessing, and saving
-    configuration settings for the application.
+    This class provides functionality for loading, accessing, and saving configuration
+    settings from a JSON file or dictionary.
     """
     
-    def __init__(self, config_file: Optional[str] = None):
+    def __init__(self, config_file: Optional[str] = None, config_dict: Optional[Dict[str, Any]] = None):
         """
         Initialize the ConfigManager.
         
         Args:
-            config_file: Optional path to a configuration file.
+            config_file: Path to the configuration file (optional)
+            config_dict: Configuration dictionary (optional)
+            
+        Raises:
+            ValueError: If neither config_file nor config_dict is provided
         """
         self.config = {}
-        self.config_file = config_file
         
-        # If config file is provided, load it
-        if config_file and os.path.exists(config_file):
+        if config_file:
             self.load_config(config_file)
+        elif config_dict:
+            self.config = config_dict
         else:
-            # Set default configuration
+            # Default configuration if neither file nor dict provided
             self.config = {
-                "connections": {},
-                "default_timeout": 30,
-                "backup_directory": "./backups",
-                "report_directory": "./reports",
-                "log_level": "INFO"
+                "storage_directory": "data"
             }
     
     def load_config(self, config_file: str) -> None:
         """
-        Load configuration from a JSON file.
+        Load configuration from a file.
         
         Args:
-            config_file: Path to the configuration file.
+            config_file: Path to the configuration file
             
         Raises:
-            FileNotFoundError: If the configuration file does not exist.
-            json.JSONDecodeError: If the configuration file is not valid JSON.
+            FileNotFoundError: If the configuration file does not exist
+            ValueError: If the configuration file is not valid JSON
         """
         try:
+            logger.info(f"Loading configuration from {config_file}")
+            
+            if not os.path.exists(config_file):
+                raise FileNotFoundError(f"Configuration file {config_file} not found")
+            
             with open(config_file, 'r') as f:
                 self.config = json.load(f)
-            logger.info(f"Loaded configuration from {config_file}")
-        except FileNotFoundError:
-            logger.error(f"Configuration file {config_file} not found")
-            raise
-        except json.JSONDecodeError:
-            logger.error(f"Configuration file {config_file} is not valid JSON")
+                
+            logger.info("Configuration loaded successfully")
+        except json.JSONDecodeError as e:
+            logger.error(f"Error decoding JSON configuration: {str(e)}")
+            raise ValueError(f"Invalid JSON in configuration file: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error loading configuration: {str(e)}")
             raise
     
-    def save_config(self, config_file: Optional[str] = None) -> None:
+    def save_config(self, config_file: str) -> None:
         """
-        Save the current configuration to a JSON file.
+        Save configuration to a file.
         
         Args:
-            config_file: Optional path to save the configuration file.
-                         If not provided, uses the original path.
-        """
-        file_path = config_file or self.config_file
-        if not file_path:
-            logger.warning("No configuration file path provided, skipping save")
-            return
-        
-        try:
-            # Ensure the directory exists
-            os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+            config_file: Path to the configuration file
             
-            with open(file_path, 'w') as f:
-                json.dump(self.config, f, indent=4)
-            logger.info(f"Saved configuration to {file_path}")
+        Raises:
+            IOError: If the configuration file cannot be written
+        """
+        try:
+            logger.info(f"Saving configuration to {config_file}")
+            
+            # Create directory if it doesn't exist
+            directory = os.path.dirname(os.path.abspath(config_file))
+            os.makedirs(directory, exist_ok=True)
+            
+            with open(config_file, 'w') as f:
+                json.dump(self.config, f, indent=2)
+                
+            logger.info("Configuration saved successfully")
         except Exception as e:
-            logger.error(f"Failed to save configuration: {str(e)}")
+            logger.error(f"Error saving configuration: {str(e)}")
             raise
     
     def get_value(self, key: str, default: Any = None) -> Any:
         """
-        Get a configuration value by key.
+        Get a configuration value.
         
         Args:
-            key: The configuration key.
-            default: Default value to return if key is not found.
+            key: The configuration key
+            default: Default value if the key is not found
             
         Returns:
-            The configuration value or the default value if not found.
+            The configuration value or the default value
         """
-        # Support nested keys with dot notation (e.g., "connections.postgres")
+        # Handle nested keys with dot notation (e.g., "connections.mysql.host")
         if '.' in key:
-            parts = key.split('.')
-            current = self.config
-            for part in parts:
-                if part in current:
-                    current = current[part]
+            keys = key.split('.')
+            value = self.config
+            
+            for k in keys:
+                if isinstance(value, dict) and k in value:
+                    value = value[k]
                 else:
                     return default
-            return current
+                    
+            return value
         
+        # Simple key lookup
         return self.config.get(key, default)
     
     def set_value(self, key: str, value: Any) -> None:
@@ -125,37 +128,44 @@ class ConfigManager:
         Set a configuration value.
         
         Args:
-            key: The configuration key.
-            value: The value to set.
+            key: The configuration key
+            value: The value to set
         """
-        # Support nested keys with dot notation
+        # Handle nested keys with dot notation (e.g., "connections.mysql.host")
         if '.' in key:
-            parts = key.split('.')
-            current = self.config
-            for part in parts[:-1]:
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-            current[parts[-1]] = value
+            keys = key.split('.')
+            config = self.config
+            
+            # Navigate to the nested dictionary
+            for k in keys[:-1]:
+                if k not in config:
+                    config[k] = {}
+                config = config[k]
+                
+            # Set the value in the nested dictionary
+            config[keys[-1]] = value
         else:
+            # Simple key setting
             self.config[key] = value
     
     def get_connection_config(self, connection_id: str) -> Dict[str, Any]:
         """
-        Get the configuration for a specific database connection.
+        Get configuration for a specific database connection.
         
         Args:
-            connection_id: The ID of the connection.
+            connection_id: The connection ID
             
         Returns:
-            A dictionary with the connection configuration.
+            The connection configuration or an empty dictionary
             
         Raises:
-            KeyError: If the connection ID is not found.
+            ValueError: If the connection ID is not found
         """
         connections = self.get_value("connections", {})
+        
         if connection_id not in connections:
-            raise KeyError(f"Connection configuration for {connection_id} not found")
+            logger.warning(f"Connection {connection_id} not found in configuration")
+            raise ValueError(f"Connection {connection_id} not found in configuration")
         
         return connections[connection_id]
     
@@ -164,35 +174,37 @@ class ConfigManager:
         Add or update a connection configuration.
         
         Args:
-            connection_id: The ID of the connection.
-            config: The connection configuration.
+            connection_id: The connection ID
+            config: The connection configuration
         """
-        connections = self.get_value("connections", {})
-        connections[connection_id] = config
-        self.set_value("connections", connections)
+        if "connections" not in self.config:
+            self.config["connections"] = {}
+            
+        self.config["connections"][connection_id] = config
+        logger.info(f"Added configuration for connection {connection_id}")
     
     def remove_connection_config(self, connection_id: str) -> None:
         """
         Remove a connection configuration.
         
         Args:
-            connection_id: The ID of the connection to remove.
+            connection_id: The connection ID
             
         Raises:
-            KeyError: If the connection ID is not found.
+            ValueError: If the connection ID is not found
         """
-        connections = self.get_value("connections", {})
-        if connection_id not in connections:
-            raise KeyError(f"Connection configuration for {connection_id} not found")
-        
-        del connections[connection_id]
-        self.set_value("connections", connections)
+        if "connections" not in self.config or connection_id not in self.config["connections"]:
+            logger.warning(f"Connection {connection_id} not found in configuration")
+            raise ValueError(f"Connection {connection_id} not found in configuration")
+            
+        del self.config["connections"][connection_id]
+        logger.info(f"Removed configuration for connection {connection_id}")
     
-    def list_connections(self) -> List[str]:
+    def get_all_connection_ids(self) -> list:
         """
-        List all configured connections.
+        Get all configured connection IDs.
         
         Returns:
-            A list of connection IDs.
+            List of connection IDs
         """
         return list(self.get_value("connections", {}).keys())
