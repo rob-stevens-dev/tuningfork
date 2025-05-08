@@ -1,0 +1,31 @@
+# Core dependencies
+paramiko>=2.12.0     # For SSH tunneling
+cryptography>=40.0.0  # Required by paramiko for key handling
+
+# Database connectors
+psycopg2-binary>=2.9.6    # PostgreSQL connector
+mysql-connector-python>=8.0.33  # MySQL/MariaDB connector
+pyodbc>=4.0.39      # SQL Server connector via ODBC
+cx_Oracle>=8.3.0    # Oracle connector
+
+# Cloud provider SDKs
+boto3>=1.28.0        # AWS SDK
+azure-identity>=1.13.0  # Azure authentication
+azure-mgmt-rdbms>=10.1.0  # Azure Database management
+azure-mgmt-sql>=3.0.1  # Azure SQL management
+google-auth>=2.22.0  # Google authentication
+# google-cloud-sql>=1.0.0  # Optional - Google Cloud SQL
+
+# Testing
+pytest>=7.4.0       # Testing framework
+pytest-cov>=4.1.0    # Test coverage
+
+# Utilities
+pyyaml>=6.0.0       # Configuration file handling
+click>=8.1.6        # CLI interface
+jinja2>=3.1.2       # For report templates
+matplotlib>=3.7.2   # For visualizations
+seaborn>=0.12.2     # Enhanced visualizations
+
+# Optional dependencies
+#sqlalchemy>=2.0.0   # For future ORM integration
